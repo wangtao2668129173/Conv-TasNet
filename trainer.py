@@ -1,193 +1,198 @@
 import torch
+import torch.nn as nn
 import time
 import os
 import sys
-from utils import get_logger
-from Conv_TasNet import check_parameters
+import random
+from utils.logger import get_logger
+from model import check_parameters
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.nn.parallel import data_parallel
+import torch.utils.data.distributed
 from torch.nn.utils import clip_grad_norm_
-from SI_SNR import si_snr_loss
-import matplotlib.pyplot as plt
+from loss import si_snr_loss
+import tqdm
+import torch.distributed as dist
+import torch.backends.cudnn as cudnn
+import warnings
+from data import DataLoaders,wav_dataset
+from model import ConvTasNet,Dual_RNN_model
 
-def to_device(dicts, device):
-    '''
-       load dict data to cuda
-    '''
-    def to_cuda(datas):
-        if isinstance(datas, torch.Tensor):
-            return datas.to(device)
-        elif isinstance(datas,list):
-            return [data.to(device) for data in datas]
-        else:
-            raise RuntimeError('datas is not torch.Tensor and list type')
+def main_worker(gpu, ngpus_per_node,opt,args):
+    if args.seed is not None:
+        random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        cudnn.deterministic = True
+        warnings.warn('You have chosen to seed training. '
+                      'This will turn on the CUDNN deterministic setting, '
+                      'which can slow down your training considerably! '
+                      'You may see unexpected behavior when restarting '
+                      'from checkpoints.')
+    # --------------------------------- distributed init -------------------------------------- #
+    args.gpu = gpu
+    args.rank = args.rank*ngpus_per_node + args.gpu   # local 
+    args.batch_size = int(opt["datasets"]["batch_size"]/ngpus_per_node)
+    args.num_workers = int((opt["datasets"]["num_workers"]+ngpus_per_node-1)/ngpus_per_node)
+    dist.init_process_group(backend='nccl',init_method='tcp://127.0.0.1:23456',world_size=args.world_size,rank=args.rank)
+    torch.cuda.set_device(args.gpu)   
+    torch.backends.cudnn.benchmark = True
+    # -----------------------------------  data init -------------------------------------------- #
+    train_dataset = wav_dataset(**opt['datasets']['train'])
+    dataset_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)  
+    train_loader = DataLoaders(train_dataset, is_train=True, chunk_size=opt['datasets']['chunk_size'], 
+                        batch_size=args.batch_size, num_workers=args.num_workers ,sampler=dataset_sampler)
 
-    if isinstance(dicts, dict):
-        return {key: to_cuda(dicts[key]) for key in dicts}
+    val_dataset = wav_dataset(**opt['datasets']['val'])
+    val_loader = DataLoaders(val_dataset, is_train=False, chunk_size=opt['datasets']['chunk_size'], 
+                             batch_size=args.batch_size, num_workers=args.num_workers)
+    #---------------------------------- model init --------------------------------------------------#
+    current_epoch = 0
+    logger = get_logger(__name__)
+    logger.info('Building the model')
+    model = ConvTasNet(**opt['conv-Tasnet']['net_conf'])
+    #model = Dual_RNN_model(**opt['dual-path-RNN']['net_conf'])
+
+
+    #---------------------------------- resume -----------------------------------------------------#
+
+    if opt['resume']['resume_state']:     # True or False
+        cpt = torch.load(os.path.join(opt["resume"]["path"],"best.pt"), map_location="cpu")
+        current_epoch = cpt["epoch"]
+        # load nnet
+        model.load_state_dict(cpt["model_state_dict"])
+        model = model.cuda(args.gpu)
+        model = nn.parallel.DistributedDataParallel(model,device_ids=[args.gpu],output_device=args.gpu,find_unused_parameters=True)
+        optimizer = torch.optim.Adam(model.parameters(),lr=1e-3,betas=(0.9,0.98),eps=1e-08,weight_decay= 1e-5)
+        optimizer.load_state_dict(cpt["optim_state_dict"])
     else:
-        raise RuntimeError('input egs\'s type is not dict')
+        model = model.cuda(args.gpu)
+        model = nn.parallel.DistributedDataParallel(model,device_ids=[args.gpu],output_device=args.gpu,find_unused_parameters=True)
+        optimizer = torch.optim.Adam(model.parameters(),lr=1e-3,betas=(0.9,0.98),eps=1e-08,weight_decay= 1e-5)
 
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,mode='min',factor=0.5,patience=2,
+                                                            verbose=True,threshold=0.001, threshold_mode='abs',
+                                                            cooldown=0,min_lr=1e-6,eps=1e-8)
+    best_loss = 10000
+    no_impr = 0
+    scheduler.best = best_loss
+    while current_epoch < opt['epochs']:
+        logger.info("Starting epoch from {:d}, loss = {:.4f}".format(current_epoch,best_loss))
+        current_epoch += 1
+        trainer = Trainer(args=args,net=model,optimizer=optimizer,scheduler=scheduler,checkpoint=opt["model_path"],clip_norm=opt["clip_norm"],
+                    logging_period=opt["print_freq"],start_epoch=current_epoch)
+        train_loss = trainer.train(train_loader)
+        val_loss = trainer.val(val_loader)
+        if val_loss > best_loss:
+            no_impr += 1
+            logger.info('no improvement, best loss: {:.4f}'.format(scheduler.best))
+        else:
+            best_loss = val_loss
+            no_impr = 0
+            trainer.save_checkpoint(best=True)
+            logger.info('Epoch: {:d}, now best loss change: {:.4f}'.format(current_epoch,best_loss))
+        # schedule here
+        scheduler.step(val_loss)
+        # save last checkpoint
+        trainer.save_checkpoint(best=False)
 
-class Trainer():
-    '''
-       Trainer of Conv-Tasnet
-       input:
-             net: load the Conv-Tasnet model
-             checkpoint: save model path
-             optimizer: name of opetimizer
-             gpu_ids: (int/tuple) id of gpus
-             optimizer_kwargs: the kwargs of optimizer
-             clip_norm: maximum of clip norm, default: None
-             min_lr: minimun of learning rate
-             patience: Number of epochs with no improvement after which learning rate will be reduced
-             factor: Factor by which the learning rate will be reduced. new_lr = lr * factor
-             logging_period: How long to print
-             resume: the kwargs of resume, including path of model, Whether to restart
-             stop: Stop training cause no improvement
-    '''
+        if no_impr == opt["early_stop"]:
+            logger.info("Stop training cause no impr for {:d} epochs".format(no_impr))
+            break
 
-    def __init__(self,
-                 net,
-                 checkpoint="checkpoint",
-                 optimizer="adam",
-                 gpuid=0,
-                 optimizer_kwargs=None,
-                 clip_norm=None,
-                 min_lr=0,
-                 patience=0,
-                 factor=0.5,
-                 logging_period=100,
-                 resume=None,
-                 stop=6,
-                 num_epochs=100):
+    logger.info("Training for {:d}/{:d} epoches done!".format(current_epoch,num_epochs))
+
+    
+
+class Trainer(object):
+    def __init__(self,args,net,optimizer,scheduler,checkpoint="checkpoint",clip_norm=None,logging_period=100,start_epoch=0):
         # if the cuda is available and if the gpus' type is tuple
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA device unavailable...exist")
-        if not isinstance(gpuid, tuple):
-            gpuid = (gpuid, )
-        self.device = torch.device("cuda:{}".format(gpuid[0]))
-        self.gpuid = gpuid
-
+       
         # mkdir the file of Experiment path
         if checkpoint and not os.path.exists(checkpoint):
             os.makedirs(checkpoint)
         self.checkpoint = checkpoint
 
         # build the logger object
-        self.logger = get_logger(
-            os.path.join(checkpoint, "trainer.log"), file=False)
+        self.logger = get_logger(os.path.join(self.checkpoint, "trainer.log"), file=False)
         self.clip_norm = clip_norm
         self.logging_period = logging_period
-        self.cur_epoch = 0  # current epoch
-        self.stop = stop
-
-        # Whether to resume the model
-        if resume['resume_state']:
-            if not os.path.exists(resume['path']):
-                raise FileNotFoundError(
-                    "Could not find resume checkpoint: {}".format(resume))
-            cpt = torch.load(resume, map_location="cpu")
-            self.cur_epoch = cpt["epoch"]
-            self.logger.info("Resume from checkpoint {}: epoch {:d}".format(
-                resume['path'], self.cur_epoch))
-            # load nnet
-            net.load_state_dict(cpt["model_state_dict"])
-            self.net = net.to(self.device)
-            self.optimizer = self.create_optimizer(
-                optimizer, optimizer_kwargs, state=cpt["optimizer_state_dict"])
-        else:
-            self.net = net.to(self.device)
-            self.optimizer = self.create_optimizer(optimizer, optimizer_kwargs)
-
+        self.current_epoch = start_epoch
+        self.net = net
+        self.optimizer = optimizer
+        self.gpu = args.gpu
+        self.scheduler = scheduler
+      
         # check model parameters
         self.param = check_parameters(self.net)
-
-        # Reduce lr
-        self.scheduler = ReduceLROnPlateau(
-            self.optimizer, mode='min', factor=0.1, patience=patience, verbose=True, min_lr=min_lr)
-
         # logging
         self.logger.info("Starting preparing model ............")
-        self.logger.info("Loading model to GPUs:{}, #param: {:.2f}M".format(
-            gpuid, self.param))
-        self.clip_norm = clip_norm
+        self.logger.info("Loading model to GPUs:{}, #param: {:.2f}M".format(args.gpu, self.param))
         # clip norm
-        if clip_norm:
-            self.logger.info(
-                "Gradient clipping by {}, default L2".format(clip_norm))
-
-        # number of epoch
-        self.num_epochs = num_epochs
-
-    def create_optimizer(self, optimizer, kwargs, state=None):
-        '''
-           create optimizer
-           optimizer: (str) name of optimizer
-           kwargs: the kwargs of optimizer
-           state: the load model optimizer state
-        '''
-        supported_optimizer = {
-            "sgd": torch.optim.SGD,  # momentum, weight_decay, lr
-            "rmsprop": torch.optim.RMSprop,  # momentum, weight_decay, lr
-            "adam": torch.optim.Adam,  # weight_decay, lr
-            "adadelta": torch.optim.Adadelta,  # weight_decay, lr
-            "adagrad": torch.optim.Adagrad,  # lr, lr_decay, weight_decay
-            "adamax": torch.optim.Adamax  # lr, weight_decay
-        }
-        if optimizer not in supported_optimizer:
-            raise ValueError("Now only support optimizer {}".format(optimizer))
-        opt = supported_optimizer[optimizer](self.net.parameters(), **kwargs)
-        self.logger.info("Create optimizer {0}: {1}".format(optimizer, kwargs))
-        if state is not None:
-            opt.load_state_dict(state)
-            self.logger.info("Load optimizer state dict from checkpoint")
-        return opt
-
+        if self.clip_norm:
+            self.logger.info("Gradient clipping by {}, default L2".format(self.clip_norm))
+        
     def save_checkpoint(self, best=True):
         '''
             save model
             best: the best model
         '''
-        torch.save(
-            {
-                "epoch": self.cur_epoch,
+        to_save ={"epoch": self.current_epoch,
                 "model_state_dict": self.net.state_dict(),
-                "optim_state_dict": self.optimizer.state_dict()
-            },
-            os.path.join(self.checkpoint,
-                         "{0}.pt".format("best" if best else "last")))
+                "optim_state_dict": self.optimizer.state_dict()}
+        torch.save(to_save,os.path.join(self.checkpoint, "{0}.pt".format("best" if best else "last")))
+        torch.cuda.empty_cache() 
 
-    def train(self, train_dataloader):
+    def to_device(self,dicts):
+        if isinstance(dicts,dict):
+            return {key:self.to_cuda(dicts[key]) for key in dicts}
+        else:
+            raise RuntimeError('input egs\'s type is not dict')
+
+    def to_cuda(self,datas):
+        if isinstance(datas,torch.Tensor):
+            return datas.cuda(self.gpu,non_blocking=True)
+        elif isinstance(datas,list):
+            return [data.cuda(self.gpu,non_blocking=True) for data in datas]
+        else:
+            raise RuntimeError("datas is not torch.Tensor.")
+
+    def train(self,train_dataloader):
         '''
            training model
         '''
         self.logger.info('Training model ......')
+        self.net.train()
         losses = []
         start = time.time()
         current_step = 0
         for egs in train_dataloader:
             current_step += 1
-            egs = to_device(egs, self.device)
+            egs = self.to_device(egs)
             self.optimizer.zero_grad()
-            ests = data_parallel(self.net, egs['mix'], device_ids=self.gpuid)
+            ests = self.net(egs['mix'])
             loss = si_snr_loss(ests, egs)
             loss.backward()
+        
             if self.clip_norm:
                 clip_grad_norm_(self.net.parameters(), self.clip_norm)
             self.optimizer.step()
             losses.append(loss.item())
-            if len(losses) == self.logging_period:
-                avg_loss = sum(
-                    losses[-self.logging_period:])/self.logging_period
+
+            if len(losses) % self.logging_period == 0:
+                avg_loss = sum(losses[-self.logging_period:])/self.logging_period
                 self.logger.info('<epoch:{:3d}, iter:{:d}, lr:{:.3e}, loss:{:.3f}, batch:{:d} utterances> '.format(
-                    self.cur_epoch, current_step, self.optimizer.param_groups[0]['lr'], avg_loss, len(losses)))
+                    self.current_epoch, current_step, self.optimizer.param_groups[0]['lr'], avg_loss, len(losses)))
+
         end = time.time()
         total_loss_avg = sum(losses)/len(losses)
         self.logger.info('<epoch:{:3d}, lr:{:.3e}, loss:{:.3f}, Total time:{:.3f} min> '.format(
-            self.cur_epoch, self.optimizer.param_groups[0]['lr'], total_loss_avg, (end-start)/60))
+            self.current_epoch, self.optimizer.param_groups[0]['lr'], total_loss_avg, (end-start)/60))
+
         return total_loss_avg
 
-    def val(self, val_dataloader):
+    def val(self,val_dataloader):
         '''
            validation model
         '''
@@ -199,72 +204,16 @@ class Trainer():
         with torch.no_grad():
             for egs in val_dataloader:
                 current_step += 1
-                egs = to_device(egs, self.device)
-                ests = data_parallel(self.net, egs['mix'], device_ids=self.gpuid)
+                egs = self.to_device(egs)
+                ests = self.net(egs['mix'])
                 loss = si_snr_loss(ests, egs)
                 losses.append(loss.item())
-                if len(losses) == self.logging_period:
-                    avg_loss = sum(
-                        losses[-self.logging_period:])/self.logging_period
+                if len(losses) % self.logging_period == 0:
+                    avg_loss = sum(losses[-self.logging_period:])/self.logging_period
                     self.logger.info('<epoch:{:3d}, iter:{:d}, lr:{:.3e}, loss:{:.3f}, batch:{:d} utterances> '.format(
-                        self.cur_epoch, current_step, self.optimizer.param_groups[0]['lr'], avg_loss, len(losses)))
+                        self.current_epoch, current_step, self.optimizer.param_groups[0]['lr'], avg_loss, len(losses)))
         end = time.time()
         total_loss_avg = sum(losses)/len(losses)
         self.logger.info('<epoch:{:3d}, lr:{:.3e}, loss:{:.3f}, Total time:{:.3f} min> '.format(
-            self.cur_epoch, self.optimizer.param_groups[0]['lr'], total_loss_avg, (end-start)/60))
+            self.current_epoch, self.optimizer.param_groups[0]['lr'], total_loss_avg, (end-start)/60))
         return total_loss_avg
-
-    def run(self, train_dataloader, val_dataloader):
-        train_losses = []
-        val_losses = []
-        plt.title("Loss of train and test")
-        with torch.cuda.device(self.gpuid[0]):
-            stats = dict()
-            self.save_checkpoint(best=False)
-            val_loss = self.val(val_dataloader)
-            best_loss = val_loss
-            self.logger.info("Starting epoch from {:d}, loss = {:.4f}".format(
-                self.cur_epoch, best_loss))
-            no_impr = 0
-
-            self.scheduler.best = best_loss
-            while self.cur_epoch < self.num_epochs:
-                self.cur_epoch += 1
-                cur_lr = self.optimizer.param_groups[0]["lr"]
-                train_loss = self.train(train_dataloader)
-                val_loss = self.val(val_dataloader)
-
-                train_losses.append(train_loss)
-                val_losses.append(val_loss)
-
-                if val_loss > best_loss:
-                    no_impr += 1
-                    self.logger.info('no improvement, best loss: {:.4f}'.format(self.optimizer.best))
-                else:
-                    best_loss = val_loss
-                    no_impr = 0
-                    self.save_checkpoint(best=True)
-                    self.logger.info('Epoch: {:d}, now best loss change: {:.4f}'.format(self.cur_epoch,best_loss))
-                # schedule here
-                self.scheduler.step(val_loss)
-                # flush scheduler info
-                sys.stdout.flush()
-                # save last checkpoint
-                self.save_checkpoint(best=False)
-                if no_impr == self.stop:
-                    self.logger.info(
-                        "Stop training cause no impr for {:d} epochs".format(
-                            no_impr))
-                    break
-            self.logger.info("Training for {:d}/{:d} epoches done!".format(
-                self.cur_epoch, self.num_epochs))
-            
-         # loss image
-        x = [i for i in range(self.num_epochs)]
-        plt.plot(x, train_losses, 'b-', label=u'train_loss',linewidth=0.8)
-        plt.plot(x, val_losses, 'c-', label=u'val_loss',linewidth=0.8)
-        plt.legend()
-        #plt.xticks(l, lx)
-        plt.ylabel('loss')
-        plt.xlabel('epoch')
-        plt.savefig('conv_tasnet_loss.png')
